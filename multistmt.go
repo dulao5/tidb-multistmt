@@ -172,3 +172,11 @@ func (b *Batch) AddStatement(s Statement) *Batch {
 
 // Len returns the number of queued statements.
 func (b *Batch) Len() int { return len(b.stmts) }
+
+// Statements returns a copy of the queued statements, in order. Execute
+// itself has no use for this; it exists for callers that build a Batch in
+// one place and want to inspect what was queued (e.g. in tests) without
+// reaching into unexported state.
+func (b *Batch) Statements() []Statement {
+	return append([]Statement(nil), b.stmts...)
+}
