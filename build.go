@@ -53,7 +53,7 @@ type buildResult struct {
 // statement's own SET/EXECUTE pair, so that after a mid-batch failure, N
 // (0-based: N-1) is exactly the index of the statement that was attempted
 // when it failed.
-func (b *Batch) build() (*buildResult, error) {
+func (b *Batch) build(extraDealloc ...string) (*buildResult, error) {
 	var body strings.Builder
 	var dealloc []string
 
@@ -125,6 +125,11 @@ func (b *Batch) build() (*buildResult, error) {
 	}
 
 	for _, name := range dealloc {
+		body.WriteString("DEALLOCATE PREPARE ")
+		body.WriteString(name)
+		body.WriteString(";")
+	}
+	for _, name := range extraDealloc {
 		body.WriteString("DEALLOCATE PREPARE ")
 		body.WriteString(name)
 		body.WriteString(";")

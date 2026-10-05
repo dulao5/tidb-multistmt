@@ -98,14 +98,58 @@ if errors.As(err, &batchErr) {
   statements (`HasResultSet: false`) if you want transactional semantics;
   the library stays agnostic to what the statements actually do.
 
-### Prepared-statement caching (optional, orthogonal)
+### Prepared-statement caching
 
 By default every `Execute` call generates a fresh `PREPARE` name for each
 statement and `DEALLOCATE PREPARE`s it at the end of the same batch — no
-session state leaks across calls. If you want to reuse a prepared statement
-across multiple `Execute` calls on the same long-lived connection (to save
-repeated re-compilation), set a stable `Statement.PreparedName` and track
-yourself, per connection, whether it's already been prepared:
+session state leaks across calls, but nothing is reused either: a batch
+re-executed a thousand times re-compiles every statement a thousand times.
+
+**Best practice: pass `WithPreparedCache` to `Execute`, backed by a shared
+`*PreparedCache`, not manual `PreparedName` bookkeeping.** `(*sql.Stmt)` from
+plain `db.Prepare()` already solves prepared-statement reuse for free for *a
+single, repeated statement* — it transparently tracks, per physical
+connection, whether it's already been prepared there, so you never need to
+think about it. That's the right tool when you're always running the same
+one statement. It does **not** help here, because a multistmt batch isn't one
+statement — it's N different statements sent as one hand-built
+multi-statement string (`PREPARE`/`SET`/`EXECUTE`), which never goes through
+`PrepareContext` at all. `PreparedCache` is what gives a *batch of distinct
+statements* the same transparent reuse `*sql.Stmt` gives a single one:
+
+```go
+// defaults: 32 stmts/conn, 256 conns tracked; share one PreparedCache across your whole app
+cache := multistmt.NewPreparedCache(0, 0)
+
+// ... build b as usual with Add/AddStatement, no PreparedName needed ...
+
+conn, _ := db.Conn(ctx) // a single, stable *sql.Conn for this call
+err := b.Execute(ctx, conn, multistmt.WithPreparedCache(cache))
+```
+
+That's the whole API. `PreparedCache` figures out, per statement, whether
+it's already `PREPARE`d on `conn`'s *physical* connection and skips
+re-preparing it if so — including when `conn` is a brand new `*sql.Conn`
+wrapper handed back by the pool around a physical connection `PreparedCache`
+has seen before. (This is the part naive per-connection caching gets wrong:
+`database/sql` gives you a fresh `*sql.Conn` Go object on every
+`db.Conn(ctx)` checkout even when the pool reuses the same underlying TCP
+connection/TiDB session underneath, so keying a cache by the `*sql.Conn`
+pointer itself would miss every reuse opportunity across checkouts.
+`PreparedCache` keys by the physical connection instead, via
+`(*sql.Conn).Raw`.) Past `maxStmtsPerConn`, the least-recently-used statement
+on that connection is `DEALLOCATE`d (in the same round trip that needed the
+room) to make space — you don't have to think about unbounded growth either.
+
+`PreparedCache` is safe to share across goroutines/connections — create one
+per `*sql.DB` (or per process) and pass it via `WithPreparedCache` to every
+`Execute` call.
+
+If you still want fully manual control (e.g. a short-lived connection you
+know will never see a repeat, or a name you need to coordinate outside this
+library), `Statement.PreparedName`/`SkipPrepare` are still there, and
+`PreparedCache` leaves any statement that sets `PreparedName` itself alone
+entirely:
 
 ```go
 b.AddStatement(multistmt.Statement{
@@ -117,7 +161,14 @@ b.AddStatement(multistmt.Statement{
 ```
 
 When `PreparedName` is set, `Execute` never deallocates it — you own its
-lifecycle for the life of the connection.
+lifecycle for the life of the connection, whether or not `WithPreparedCache`
+is also passed.
+
+(Single-statement, non-batched reuse — "just run this one query over and
+over on a pooled connection" — is already solved by `database/sql` itself via
+`db.Prepare()`/`*sql.Stmt`; that's the right tool for that job and this
+library doesn't try to replace it. `PreparedCache` only exists for the
+batch-of-distinct-statements case `*sql.Stmt` can't cover.)
 
 ## Status
 
@@ -126,8 +177,18 @@ batches with real row delivery, a mid-batch runtime failure (duplicate key),
 a failure on the very first statement, a SQL syntax error on a later
 statement (confirmed: TiDB parses/executes each statement incrementally, so
 earlier well-formed statements still ran and are correctly reported as
-succeeded), and prepared-statement reuse across separate `Execute` calls. See
-`build_test.go` (pure unit tests) and `integration_test.go` (gated behind
+succeeded), prepared-statement reuse across separate `Execute` calls via
+manual `PreparedName`, and `PreparedCache`/`WithPreparedCache`:
+same-physical-connection identity across `database/sql` pool checkouts
+(`MaxOpenConns(1)`, verified the
+identity is stable across `Close`+`db.Conn` even though the `*sql.Conn` Go
+object changes), a cache hit on a second checkout correctly reusing the first
+checkout's server-side `PREPARE` (which would fail loudly with "Unknown
+prepared statement" from the real server if the identity tracking were
+wrong), and LRU eviction really issuing `DEALLOCATE PREPARE` on the server
+(confirmed by `EXECUTE`-ing the evicted name directly afterward and getting
+an error). See `build_test.go`/`cache_test.go` (pure unit tests) and
+`integration_test.go`/`cache_integration_test.go` (gated behind
 `MULTISTMT_TEST_DSN`, not required for `go test ./...`).
 
 Not yet covered: array/slice-valued args (`IN (?)` expansion), contexts with

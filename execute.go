@@ -15,9 +15,18 @@ import (
 // conn must be a single, stable connection (*sql.Conn, not *sql.DB) for the
 // whole call: the position-recovery marker is a session variable, and
 // PREPARE/EXECUTE must run on the same session they were issued on.
-func (b *Batch) Execute(ctx context.Context, conn *sql.Conn) error {
+func (b *Batch) Execute(ctx context.Context, conn *sql.Conn, opts ...Option) error {
 	if len(b.stmts) == 0 {
 		return nil
+	}
+
+	var o execOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+
+	if o.preparedCache != nil {
+		return b.executeWithPreparedCache(ctx, conn, o.preparedCache)
 	}
 
 	built, err := b.build()
@@ -25,6 +34,58 @@ func (b *Batch) Execute(ctx context.Context, conn *sql.Conn) error {
 		return err
 	}
 
+	return b.executeBuilt(ctx, conn, built)
+}
+
+// executeWithPreparedCache is Execute's path when WithPreparedCache was
+// given: cache decides each statement's PreparedName/SkipPrepare (and which
+// previously-cached entries must be evicted+DEALLOCATEd to make room) before
+// the batch is built, then records what actually succeeded afterwards so
+// later calls can reuse it.
+func (b *Batch) executeWithPreparedCache(ctx context.Context, conn *sql.Conn, cache *PreparedCache) error {
+	connID, err := connIdentity(conn)
+	if err != nil {
+		return err
+	}
+
+	plans, evicted := cache.plan(connID, b.stmts)
+
+	orig := b.stmts
+	shadow := make([]Statement, len(orig))
+	outcomes := make([]error, len(orig))
+	copy(shadow, orig)
+	for i := range shadow {
+		shadow[i].PreparedName = plans[i].name
+		shadow[i].SkipPrepare = plans[i].skip
+		idx := i
+		userCb := orig[i].Callback
+		shadow[i].Callback = func(r *StatementResult) {
+			outcomes[idx] = r.Err
+			if userCb != nil {
+				userCb(r)
+			}
+		}
+	}
+
+	b.stmts = shadow
+	built, buildErr := b.build(evicted...)
+	if buildErr != nil {
+		b.stmts = orig
+		return buildErr
+	}
+	execErr := b.executeBuilt(ctx, conn, built)
+	b.stmts = orig
+
+	cache.commit(connID, orig, plans, outcomes)
+
+	return execErr
+}
+
+// executeBuilt is Execute's shared core, used both with and without
+// WithPreparedCache: it runs an already-built batch's SQL and delivers
+// per-statement callbacks. built must come from b.build() (or
+// b.build(extraDealloc...)) for this same b.
+func (b *Batch) executeBuilt(ctx context.Context, conn *sql.Conn, built *buildResult) error {
 	rows, queryErr := conn.QueryContext(ctx, built.sql)
 	if queryErr != nil {
 		return b.recoverAndReport(ctx, conn, queryErr)
