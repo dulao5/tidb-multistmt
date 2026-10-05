@@ -170,6 +170,63 @@ over on a pooled connection" — is already solved by `database/sql` itself via
 library doesn't try to replace it. `PreparedCache` only exists for the
 batch-of-distinct-statements case `*sql.Stmt` can't cover.)
 
+### Best practice: prepared-cache + error handling + one connection
+
+The three pieces above (one stable `*sql.Conn`, `PreparedCache`, and
+`errors.As`-based error handling) are meant to be used together, on a
+connection that runs many transactions over its lifetime — not just in a
+single `Execute` call. This is the pattern a production caller should copy:
+
+```go
+// One PreparedCache per *sql.DB (or per process) — it's keyed by physical
+// connection, so it's shared safely across every conn this pool hands out.
+cache := multistmt.NewPreparedCache(0, 0)
+
+conn, err := db.Conn(ctx) // a single, stable *sql.Conn — not *sql.DB
+if err != nil {
+    log.Fatal(err)
+}
+defer conn.Close()
+
+for {
+    b := multistmt.New()
+    b.Add("begin", nil, false, nil)
+    b.Add("INSERT INTO accounts (id, balance) VALUES (?, ?)", []any{id, balance}, false, nil)
+    b.Add("UPDATE accounts SET balance = balance - ? WHERE id = ?", []any{amount, from}, false, nil)
+    b.Add("commit", nil, false, nil)
+
+    err := b.Execute(ctx, conn, multistmt.WithPreparedCache(cache))
+    if err == nil {
+        continue // conn is clean (commit ran); reuse it for the next transaction
+    }
+
+    var batchErr *multistmt.BatchError
+    if errors.As(err, &batchErr) {
+        log.Printf("statement #%d (%s) failed: %v", batchErr.Index, batchErr.SQL, batchErr.Err)
+    } else {
+        log.Printf("batch failed before any statement executed: %v", err)
+    }
+
+    // The batch's own trailing "commit" never ran, but "begin" did — conn is
+    // sitting on an open, uncommitted transaction. BEGIN/COMMIT/ROLLBACK
+    // aren't special-cased by this library (see above), so rolling back is
+    // the caller's job, same as it would be with any other driver call that
+    // leaves a transaction open.
+    if _, rbErr := conn.ExecContext(ctx, "ROLLBACK"); rbErr != nil {
+        log.Printf("rollback failed, conn is no longer usable: %v", rbErr)
+        return
+    }
+}
+```
+
+Across every iteration of this loop, PREPARE only happens once per distinct
+statement *text* per physical connection — `PreparedCache` recognizes the
+same `INSERT`/`UPDATE` text on the next iteration and reuses what the first
+iteration already prepared, even though `b` itself is a brand new `*Batch`
+every time. A failed iteration's `ROLLBACK` does not evict anything from the
+cache: the prepared statements themselves are still valid on the connection,
+only the data they touched got rolled back.
+
 ## Status
 
 Verified against a live TiDB (v8.5.8) covering: all-non-SELECT batches, mixed
