@@ -20,8 +20,11 @@ func TestBuild_MarkerPrecedesPrepare(t *testing.T) {
 	// The marker update for statement i must appear before that statement's
 	// own PREPARE, not after it — otherwise a failure while TiDB compiles
 	// the statement's SQL text gets attributed to the previous statement.
-	setIdx := strings.Index(built.sql, "SET @_multistmt_statement_num=1;")
-	prepIdx := strings.Index(built.sql, "PREPARE _multistmt_ps_")
+	// The INSERT is the second Add() call (marker value 2, 1-based), and it
+	// has an arg, so its marker is folded into a combined SET together with
+	// that arg's assignment.
+	setIdx := strings.Index(built.sql, "SET @_multistmt_statement_num=2,")
+	prepIdx := strings.Index(built.sql, "PREPARE _multistmt_ps_2 FROM")
 	if setIdx < 0 || prepIdx < 0 {
 		t.Fatalf("expected both a statement_num marker and a PREPARE in %q", built.sql)
 	}

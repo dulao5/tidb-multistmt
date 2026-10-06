@@ -38,8 +38,7 @@ type buildResult struct {
 //
 //	SET @_multistmt_statement_num=0;
 //	PREPARE p1 FROM '...stmt 0...';
-//	SET @_multistmt_statement_num=1;
-//	SET @_multistmt_ps_1_0=<literal>, ...;
+//	SET @_multistmt_statement_num=1, @_multistmt_ps_1_0=<literal>, ...;
 //	EXECUTE p1 USING @_multistmt_ps_1_0, ...;
 //	PREPARE p2 FROM '...stmt 1...';
 //	SET @_multistmt_statement_num=2;
@@ -51,9 +50,14 @@ type buildResult struct {
 // Every generated PREPARE is deallocated at the end of the same batch unless
 // the statement set PreparedName (the caller then owns its lifecycle). The
 // SET @_multistmt_statement_num=N marker is placed immediately before each
-// statement's own SET/EXECUTE pair, so that after a mid-batch failure, N
-// (0-based: N-1) is exactly the index of the statement that was attempted
-// when it failed.
+// statement's own PREPARE, so that after a mid-batch failure, N (0-based:
+// N-1) is exactly the index of the statement that was attempted when it
+// failed. When the statement also has Args, their SET is folded into the
+// very same SET statement as the marker (one dispatch instead of two) —
+// safe because the marker's only hard constraint is "before this
+// statement's PREPARE", and the args don't need PREPARE to have run yet
+// either (their variable names are derived from the statement's prepared
+// name string, not from PREPARE's own execution).
 func (b *Batch) build(extraDealloc ...string) (*buildResult, error) {
 	var body strings.Builder
 	var dealloc []string
@@ -72,11 +76,27 @@ func (b *Batch) build(extraDealloc ...string) (*buildResult, error) {
 		// statement — strictly before its own PREPARE — so that even a
 		// failure while TiDB compiles this statement's SQL text (e.g. a
 		// syntax error inside the PREPARE ... FROM '...' argument) is
-		// attributed to this statement, not the previous one.
+		// attributed to this statement, not the previous one. Any Args this
+		// statement has are folded into the same SET (one dispatch instead
+		// of a separate marker-SET-then-args-SET pair).
 		body.WriteString("SET ")
 		body.WriteString(statementNumVar)
 		body.WriteString("=")
 		body.WriteString(strconv.Itoa(i + 1))
+
+		varNames := make([]string, len(s.Args))
+		for k, a := range s.Args {
+			lit, err := sqlValueLiteral(a)
+			if err != nil {
+				return nil, fmt.Errorf("multistmt: statement #%d arg %d: %w", i, k, err)
+			}
+			vn := fmt.Sprintf("@_multistmt_%s_%d", name, k)
+			varNames[k] = vn
+			body.WriteString(", ")
+			body.WriteString(vn)
+			body.WriteString("=")
+			body.WriteString(lit)
+		}
 		body.WriteString(";")
 
 		if !s.SkipPrepare {
@@ -88,27 +108,6 @@ func (b *Batch) build(extraDealloc ...string) (*buildResult, error) {
 			body.WriteString(name)
 			body.WriteString(" FROM ")
 			body.WriteString(quoted)
-			body.WriteString(";")
-		}
-
-		varNames := make([]string, len(s.Args))
-		for k, a := range s.Args {
-			lit, err := sqlValueLiteral(a)
-			if err != nil {
-				return nil, fmt.Errorf("multistmt: statement #%d arg %d: %w", i, k, err)
-			}
-			vn := fmt.Sprintf("@_multistmt_%s_%d", name, k)
-			varNames[k] = vn
-			if k == 0 {
-				body.WriteString("SET ")
-			} else {
-				body.WriteString(", ")
-			}
-			body.WriteString(vn)
-			body.WriteString("=")
-			body.WriteString(lit)
-		}
-		if len(varNames) > 0 {
 			body.WriteString(";")
 		}
 
