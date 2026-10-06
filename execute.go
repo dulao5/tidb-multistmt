@@ -15,6 +15,11 @@ import (
 // conn must be a single, stable connection (*sql.Conn, not *sql.DB) for the
 // whole call: the position-recovery marker is a session variable, and
 // PREPARE/EXECUTE must run on the same session they were issued on.
+//
+// opts configures this one call; the only option today is WithPreparedCache,
+// which enables server-side PREPARE reuse across repeated Execute calls on
+// the same physical connection. With no opts, every statement is freshly
+// PREPAREd and DEALLOCATEd within this single call.
 func (b *Batch) Execute(ctx context.Context, conn *sql.Conn, opts ...Option) error {
 	if len(b.stmts) == 0 {
 		return nil
