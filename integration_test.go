@@ -227,6 +227,52 @@ func TestIntegration_ExpandInSelectsMultipleRows(t *testing.T) {
 	}
 }
 
+func TestIntegration_ExpandValuesBulkInsert(t *testing.T) {
+	conn, cleanup := testConn(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	// Deliberately adversarial strings: quotes, backslashes, and a
+	// SQL-injection-shaped payload, to confirm ExpandValues's flattened
+	// args still go through the normal per-value escaping path (the same
+	// one Add always used) rather than some new, unescaped code path.
+	rows := [][]any{
+		{1, "a"},
+		{2, "it's"},
+		{3, `back\slash`},
+		{4, "'; DROP TABLE multistmt_it; --"},
+	}
+	sqlText, args, err := multistmt.ExpandValues("INSERT INTO multistmt_it (id, name) VALUES (?, ?)", rows)
+	if err != nil {
+		t.Fatalf("ExpandValues: %v", err)
+	}
+
+	b := multistmt.New()
+	b.Add(sqlText, args, false, nil)
+	if err := b.Execute(ctx, conn); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	var count int
+	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM multistmt_it").Scan(&count); err != nil {
+		t.Fatalf("count query: %v", err)
+	}
+	if count != len(rows) {
+		t.Fatalf("expected %d rows, got %d (the table must still exist: DROP TABLE must not have executed)", len(rows), count)
+	}
+
+	for _, row := range rows {
+		id, name := row[0].(int), row[1].(string)
+		var got string
+		if err := conn.QueryRowContext(ctx, "SELECT name FROM multistmt_it WHERE id = ?", id).Scan(&got); err != nil {
+			t.Fatalf("select id=%d: %v", id, err)
+		}
+		if got != name {
+			t.Errorf("id=%d: got name %q, want %q", id, got, name)
+		}
+	}
+}
+
 func TestIntegration_PreparedNameReusedAcrossExecuteCalls(t *testing.T) {
 	conn, cleanup := testConn(t)
 	defer cleanup()

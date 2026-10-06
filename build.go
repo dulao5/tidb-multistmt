@@ -1,6 +1,7 @@
 package multistmt
 
 import (
+	"database/sql/driver"
 	"fmt"
 	"strconv"
 	"strings"
@@ -139,7 +140,22 @@ func (b *Batch) build(extraDealloc ...string) (*buildResult, error) {
 }
 
 // sqlStringLiteral quotes s as a single-quoted SQL string literal, for use
-// as the argument to "PREPARE name FROM '...'".
+// as the argument to "PREPARE name FROM '...'" and every "SET @v='...'" this
+// package emits for a string/[]byte-valued arg.
+//
+// Its escaping (backslash doubled, then single-quote backslash-escaped)
+// matches TiDB/MySQL's own default string-literal syntax — the one in
+// effect unless the session's sql_mode includes NO_BACKSLASH_ESCAPES, in
+// which case backslash stops being special, and this function's output is
+// no longer a safe literal. This package's whole binding mechanism works by
+// embedding values as literal SQL text (there is no lower-level wire
+// parameter binding to fall back on — see the package doc comment), so a
+// caller running with NO_BACKSLASH_ESCAPES must not pass untrusted string
+// data through Statement.Args/ExpandIn/ExpandValues. The same is true if the
+// connection's character set is a legacy multi-byte encoding where a
+// trailing lead byte can swallow the escaping backslash that follows it
+// (classic "GBK injection"); TiDB's ASCII-compatible encodings (utf8,
+// utf8mb4, latin1, binary) do not have this problem.
 func sqlStringLiteral(s string) (string, error) {
 	escaped := strings.ReplaceAll(s, "\\", "\\\\")
 	escaped = strings.ReplaceAll(escaped, "'", "\\'")
@@ -148,8 +164,19 @@ func sqlStringLiteral(s string) (string, error) {
 
 // sqlValueLiteral formats a bound arg as a SQL literal suitable for a
 // "SET @v = <literal>" assignment, mirroring the small set of types
-// database/sql itself accepts as driver.Value / commonly-passed Go types.
+// database/sql itself accepts as driver.Value / commonly-passed Go types,
+// plus any type implementing driver.Valuer (e.g. sql.NullString,
+// sql.NullInt64, or a custom column type), whose returned driver.Value is
+// formatted the same way.
 func sqlValueLiteral(v any) (string, error) {
+	if dv, ok := v.(driver.Valuer); ok {
+		val, err := dv.Value()
+		if err != nil {
+			return "", fmt.Errorf("driver.Valuer.Value: %w", err)
+		}
+		return sqlValueLiteral(val)
+	}
+
 	switch x := v.(type) {
 	case nil:
 		return "NULL", nil

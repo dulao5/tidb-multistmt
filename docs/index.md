@@ -57,6 +57,20 @@ See the [README's worked example](https://github.com/dulao5/tidb-multistmt#best-
 for the full runnable loop. The API reference below documents each piece
 individually.
 
+## Array args: `IN (?)` and bulk `INSERT`
+
+`Statement.Args` binds one Go value per `?`, so a variable-length list needs
+its placeholder text rewritten first. `ExpandIn` expands a single `?` into a
+comma-separated run for `WHERE col IN (?)`; `ExpandValues` expands a
+single-row `VALUES (?, ?)` template into one copy per row for bulk inserts.
+Both are plain functions — call them before `Add`/`AddStatement`, nothing
+else changes. See the README's
+[`WHERE id IN (?)`](https://github.com/dulao5/tidb-multistmt#where-id-in--with-a-variable-length-list)
+and
+[bulk `INSERT`](https://github.com/dulao5/tidb-multistmt#bulk-insert--values----)
+sections for the full examples and the caveats around `PreparedCache` and
+string escaping.
+
 ---
 
 
@@ -77,6 +91,7 @@ This only works at the application layer: it cannot recover the driver\-hidden a
 
 - [Variables](<#variables>)
 - [func ExpandIn\(sqlText string, args \[\]any\) \(string, \[\]any, error\)](<#ExpandIn>)
+- [func ExpandValues\(sqlText string, rows \[\]\[\]any\) \(string, \[\]any, error\)](<#ExpandValues>)
 - [type Batch](<#Batch>)
   - [func New\(\) \*Batch](<#New>)
   - [func \(b \*Batch\) Add\(sqlText string, args \[\]any, hasResultSet bool, cb func\(\*StatementResult\)\) \*Batch](<#Batch.Add>)
@@ -124,6 +139,21 @@ This exists because Statement.Args binds positionally, one Go value per "?" \(se
 Call ExpandIn before Batch.Add/AddStatement; it does not touch a Batch or the server, so its result can be inspected or reused independently of multistmt's execution path \(e.g. in a table\-driven test, or cached by the caller alongside the slice length that produced it\).
 
 args is scanned left to right in lockstep with sqlText's "?" occurrences \(skipping any "?" that appears inside a '...' or "..." string literal, so a literal question mark in a LIKE pattern or similar is left alone and does not consume an arg\). A \[\]byte arg is never expanded — it is treated as a single opaque value, matching database/sql's own convention for binary data — only other slice/array kinds trigger expansion. It is an error if the number of \(non\-literal\) "?" placeholders does not match len\(args\), or if any slice/array arg is empty \(ErrEmptyInArgs\).
+
+<a name="ExpandValues"></a>
+## func ExpandValues
+
+```go
+func ExpandValues(sqlText string, rows [][]any) (string, []any, error)
+```
+
+ExpandValues rewrites sqlText's single value\-tuple template — a parenthesized, comma\-separated run of "?" and nothing else, e.g. the "\(?, ?\)" in "INSERT INTO accounts \(id, balance\) VALUES \(?, ?\)" — into one copy of that tuple per row in rows, comma\-joined, and returns the flattened args to match: turning a two\-column template plus \[\]\[\]any\{\{1, 100\}, \{2, 200\}, \{3, 300\}\} into "VALUES \(?, ?\), \(?, ?\), \(?, ?\)" plus six args in row\-major order.
+
+This is ExpandIn's counterpart for the "one row per call becomes N rows per call" shape instead of the "one value becomes N values" shape; together they're the two ways Statement.Args' one\-Go\-value\-per\-"?" contract needs help expressing a variable\-length list. Call it before Batch.Add/AddStatement, same as ExpandIn — it doesn't touch a Batch or the server.
+
+sqlText must contain exactly one parenthesized group whose content, trimmed of whitespace, is purely "?" placeholders separated by commas \(nothing else — no column names, no expressions\) — that is the row template ExpandValues repeats. A column\-list parenthesis like the "\(id, balance\)" above does not qualify \(it names columns, not placeholders\), so the usual "INSERT INTO t \(col, ...\) VALUES \(?, ...\)" shape has exactly one qualifying group, as intended. It is an error if sqlText has zero such groups \(ExpandValues can't find a template to repeat\), more than one \(ambiguous — ExpandValues does not guess which one you meant\), rows is empty, or any row's length doesn't match the template's placeholder count.
+
+Every element of every row is still escaped exactly the way a scalar Statement.Args element always is — one value per flattened "?", bound via Execute's own "SET @v=\<literal\>; EXECUTE ... USING @v" mechanism \(see build.go's sqlValueLiteral\) — ExpandValues only rewrites placeholder text and reorders/flattens the Go values; it never itself formats a value into SQL, so it carries no escaping behavior of its own to get wrong.
 
 <a name="Batch"></a>
 ## type Batch

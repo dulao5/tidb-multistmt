@@ -207,6 +207,73 @@ matters for your workload, pad the list up to a fixed set of bucket sizes
 fill) before calling `ExpandIn`, so the same few SQL texts repeat and
 actually get cached.
 
+### Bulk `INSERT ... VALUES (?), (?), (?)`
+
+`ExpandValues` is `ExpandIn`'s counterpart for the opposite shape: instead of
+one value becoming N values, one *row* becomes N rows. Write a single-row
+template and pass your rows as `[][]any`:
+
+```go
+rows := [][]any{
+    {1, 100},
+    {2, 200},
+    {3, 300},
+}
+sqlText, args, err := multistmt.ExpandValues(
+    "INSERT INTO accounts (id, balance) VALUES (?, ?)", // one-row template
+    rows,
+)
+if err != nil {
+    log.Fatal(err)
+}
+b.Add(sqlText, args, false, nil)
+```
+
+This turns into `INSERT INTO accounts (id, balance) VALUES (?,?),(?,?),(?,?)`
+plus the six args flattened in row order. `ExpandValues` requires the
+template to contain exactly one parenthesized, placeholder-only group — the
+`(id, balance)` column list isn't one (it names columns, not `?`s), so it's
+left alone; only the `(?, ?)` after `VALUES` qualifies. Every row must have
+the same length as that group's placeholder count, or `ExpandValues` errors
+naming the offending row index. This only covers "one column set, one VALUES
+shape" — per-row `ON DUPLICATE KEY UPDATE` or varying column sets per row are
+not something `ExpandValues` tries to generate; write that part of the SQL
+text yourself around the template, same as with any other statement.
+
+`ExpandValues` never formats a value into SQL itself — it only rewrites
+placeholder text and reorders/flattens the Go values you gave it. Every
+element of every row is escaped exactly the way a plain `Statement.Args`
+element always is (see `sqlValueLiteral` in `build.go`), so there's no
+separate escaping path for bulk inserts to audit. That shared path now also
+accepts any type implementing `driver.Valuer` (`sql.NullString`,
+`sql.NullInt64`, a custom column type, ...), formatting whatever
+`driver.Value` it returns the same way as a plain value of that type.
+
+**On that shared escaping path's own limits** (not new to `ExpandValues`,
+but worth stating explicitly since bulk inserts are the usage this library
+expects to carry the most untrusted-ish data): this library has no wire-level
+parameter binding to fall back on — every arg is embedded as literal SQL text
+via `SET @v=<literal>` (see the package doc comment for why: a batch is one
+hand-built multi-statement string, never routed through
+`(*sql.DB).PrepareContext`). `sqlStringLiteral`'s escaping matches TiDB/MySQL's
+default string-literal syntax, and is only safe under that default: a session
+running with `sql_mode=...,NO_BACKSLASH_ESCAPES` (backslash stops being
+special) or a connection using a legacy multi-byte charset where a lead byte
+can absorb the following escape character (the classic "GBK injection" class
+of bug — TiDB's `utf8`/`utf8mb4`/`latin1`/`binary` charsets don't have this
+problem) breaks this escaping's safety guarantee. Don't pass untrusted string
+data through `Statement.Args`/`ExpandIn`/`ExpandValues` under either of those
+configurations.
+
+The same cache-key caveat as `ExpandIn` applies here, with a different
+mitigation: `PreparedCache` keys on the final SQL text, and `ExpandValues`
+bakes the row count into it, so a call site whose batch size varies a lot
+gets little benefit from the cache. Unlike `ExpandIn`'s list case, you can't
+safely "pad" a batch of rows the way you can pad a value list (padding would
+insert extra, possibly conflicting, rows) — the natural fix here is fixed-size
+chunking instead: always call `ExpandValues` with exactly N rows per batch,
+letting the final, possibly-shorter chunk miss the cache once.
+
 ### Best practice: prepared-cache + error handling + one connection
 
 The three pieces above (one stable `*sql.Conn`, `PreparedCache`, and
@@ -281,15 +348,17 @@ checkout's server-side `PREPARE` (which would fail loudly with "Unknown
 prepared statement" from the real server if the identity tracking were
 wrong), and LRU eviction really issuing `DEALLOCATE PREPARE` on the server
 (confirmed by `EXECUTE`-ing the evicted name directly afterward and getting
-an error), and `ExpandIn` producing a SELECT whose `IN (?)` list actually
-returns the expected multiple rows. See `build_test.go`/`cache_test.go`/
-`inexpand_test.go` (pure unit tests) and `integration_test.go`/
-`cache_integration_test.go` (gated behind `MULTISTMT_TEST_DSN`, not required
-for `go test ./...`).
+an error), `ExpandIn` producing a SELECT whose `IN (?)` list actually
+returns the expected multiple rows, and `ExpandValues` bulk-inserting several
+rows — including rows containing quotes, backslashes, and a
+SQL-injection-shaped string (`'; DROP TABLE ...; --`) — in one round trip and
+reading every one back correctly (the table surviving the round trip is
+itself part of what's being checked). See
+`build_test.go`/`cache_test.go`/`inexpand_test.go`/`values_test.go` (pure
+unit tests) and `integration_test.go`/`cache_integration_test.go` (gated
+behind `MULTISTMT_TEST_DSN`, not required for `go test ./...`).
 
-Not yet covered: a bulk `INSERT INTO ... VALUES (?),(?),(?)` helper
-(tracked separately — `ExpandIn` only addresses the `WHERE ... IN (?)` read
-side), contexts with `QueryRowContext`-style single-row conveniences, and any
-benchmark of the actual throughput/latency trade-off against
-one-statement-per-round-trip — this library is about *correctness of
+Not yet covered: contexts with `QueryRowContext`-style single-row
+conveniences, and any benchmark of the actual throughput/latency trade-off
+against one-statement-per-round-trip — this library is about *correctness of
 per-statement result handling*, not a performance claim.

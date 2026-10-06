@@ -55,5 +55,19 @@ See the [README's worked example](https://github.com/dulao5/tidb-multistmt#best-
 for the full runnable loop. The API reference below documents each piece
 individually.
 
+## Array args: `IN (?)` and bulk `INSERT`
+
+`Statement.Args` binds one Go value per `?`, so a variable-length list needs
+its placeholder text rewritten first. `ExpandIn` expands a single `?` into a
+comma-separated run for `WHERE col IN (?)`; `ExpandValues` expands a
+single-row `VALUES (?, ?)` template into one copy per row for bulk inserts.
+Both are plain functions — call them before `Add`/`AddStatement`, nothing
+else changes. See the README's
+[`WHERE id IN (?)`](https://github.com/dulao5/tidb-multistmt#where-id-in--with-a-variable-length-list)
+and
+[bulk `INSERT`](https://github.com/dulao5/tidb-multistmt#bulk-insert--values----)
+sections for the full examples and the caveats around `PreparedCache` and
+string escaping.
+
 ---
 
