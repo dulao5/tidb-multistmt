@@ -170,6 +170,43 @@ over on a pooled connection" — is already solved by `database/sql` itself via
 library doesn't try to replace it. `PreparedCache` only exists for the
 batch-of-distinct-statements case `*sql.Stmt` can't cover.)
 
+### `WHERE id IN (?)` with a variable-length list
+
+`Statement.Args` binds one Go value per `?`, so a plain `?` can't carry a
+variable-length list by itself. `ExpandIn` rewrites the SQL text and flattens
+the args before you call `Add`:
+
+```go
+sqlText, args, err := multistmt.ExpandIn(
+    "SELECT balance FROM accounts WHERE id IN (?)",
+    []any{ids}, // ids is a []int
+)
+if err != nil {
+    log.Fatal(err)
+}
+b.Add(sqlText, args, true, func(r *multistmt.StatementResult) { ... })
+```
+
+With `ids = []int{1, 2, 3}`, this turns into
+`SELECT balance FROM accounts WHERE id IN (?,?,?)` plus three flattened `int`
+args — exactly the placeholder count `EXECUTE ... USING` needs. Non-slice
+args in the same statement pass through untouched, and a `[]byte` arg is
+never expanded (it's a single blob value, matching `database/sql`'s own
+convention). An empty slice is rejected (`ErrEmptyInArgs`) rather than
+silently becoming `IN (NULL)`, since that would change the query's meaning,
+not just its placeholder count.
+
+One thing to know before combining this with `PreparedCache`: the cache key
+is the final SQL text, and `ExpandIn` bakes the list's length into that text
+(`IN (?,?,?)` vs `IN (?,?)` are different statements to `PREPARE`). That's
+correct — a placeholder count has to match the list it binds — but it means
+a call site whose list length varies a lot on every call gets little benefit
+from `PreparedCache`, since every new length is a cache miss. If that
+matters for your workload, pad the list up to a fixed set of bucket sizes
+(e.g. always call with length 1, 4, 16, or 64, repeating the last element to
+fill) before calling `ExpandIn`, so the same few SQL texts repeat and
+actually get cached.
+
 ### Best practice: prepared-cache + error handling + one connection
 
 The three pieces above (one stable `*sql.Conn`, `PreparedCache`, and
@@ -244,12 +281,15 @@ checkout's server-side `PREPARE` (which would fail loudly with "Unknown
 prepared statement" from the real server if the identity tracking were
 wrong), and LRU eviction really issuing `DEALLOCATE PREPARE` on the server
 (confirmed by `EXECUTE`-ing the evicted name directly afterward and getting
-an error). See `build_test.go`/`cache_test.go` (pure unit tests) and
-`integration_test.go`/`cache_integration_test.go` (gated behind
-`MULTISTMT_TEST_DSN`, not required for `go test ./...`).
+an error), and `ExpandIn` producing a SELECT whose `IN (?)` list actually
+returns the expected multiple rows. See `build_test.go`/`cache_test.go`/
+`inexpand_test.go` (pure unit tests) and `integration_test.go`/
+`cache_integration_test.go` (gated behind `MULTISTMT_TEST_DSN`, not required
+for `go test ./...`).
 
-Not yet covered: array/slice-valued args (`IN (?)` expansion), contexts with
-`QueryRowContext`-style single-row conveniences, and any benchmark of the
-actual throughput/latency trade-off against one-statement-per-round-trip —
-this library is about *correctness of per-statement result handling*, not a
-performance claim.
+Not yet covered: a bulk `INSERT INTO ... VALUES (?),(?),(?)` helper
+(tracked separately — `ExpandIn` only addresses the `WHERE ... IN (?)` read
+side), contexts with `QueryRowContext`-style single-row conveniences, and any
+benchmark of the actual throughput/latency trade-off against
+one-statement-per-round-trip — this library is about *correctness of
+per-statement result handling*, not a performance claim.

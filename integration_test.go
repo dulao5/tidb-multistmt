@@ -13,6 +13,7 @@ import (
 	"database/sql"
 	"errors"
 	"os"
+	"reflect"
 	"testing"
 
 	"github.com/dulao5/tidb-multistmt"
@@ -185,6 +186,44 @@ func TestIntegration_SyntaxErrorAttributedToFailingStatement(t *testing.T) {
 	}
 	if count != 1 {
 		t.Errorf("expected the well-formed leading statement to have committed, got %d rows", count)
+	}
+}
+
+func TestIntegration_ExpandInSelectsMultipleRows(t *testing.T) {
+	conn, cleanup := testConn(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	b := multistmt.New()
+	b.Add("INSERT INTO multistmt_it (id, name) VALUES (?, ?)", []any{1, "a"}, false, nil)
+	b.Add("INSERT INTO multistmt_it (id, name) VALUES (?, ?)", []any{2, "b"}, false, nil)
+	b.Add("INSERT INTO multistmt_it (id, name) VALUES (?, ?)", []any{3, "c"}, false, nil)
+
+	sqlText, args, err := multistmt.ExpandIn("SELECT name FROM multistmt_it WHERE id IN (?) ORDER BY id", []any{[]int{1, 3}})
+	if err != nil {
+		t.Fatalf("ExpandIn: %v", err)
+	}
+
+	var names []string
+	b.Add(sqlText, args, true, func(r *multistmt.StatementResult) {
+		if r.Err != nil {
+			t.Errorf("IN-expanded select failed: %v", r.Err)
+			return
+		}
+		for r.Rows.Next() {
+			var name string
+			if err := r.Rows.Scan(&name); err != nil {
+				t.Errorf("scan: %v", err)
+			}
+			names = append(names, name)
+		}
+	})
+
+	if err := b.Execute(ctx, conn); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !reflect.DeepEqual(names, []string{"a", "c"}) {
+		t.Fatalf("expected [a c], got %v", names)
 	}
 }
 
