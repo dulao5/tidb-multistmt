@@ -96,7 +96,9 @@ This only works at the application layer: it cannot recover the driver\-hidden a
   - [func New\(\) \*Batch](<#New>)
   - [func \(b \*Batch\) Add\(sqlText string, args \[\]any, hasResultSet bool, cb func\(\*StatementResult\)\) \*Batch](<#Batch.Add>)
   - [func \(b \*Batch\) AddStatement\(s Statement\) \*Batch](<#Batch.AddStatement>)
+  - [func \(b \*Batch\) BuildSetOnlySQL\(\) \(string, error\)](<#Batch.BuildSetOnlySQL>)
   - [func \(b \*Batch\) Execute\(ctx context.Context, conn \*sql.Conn, opts ...Option\) error](<#Batch.Execute>)
+  - [func \(b \*Batch\) ExecuteSetOnly\(ctx context.Context, conn \*sql.Conn\) error](<#Batch.ExecuteSetOnly>)
   - [func \(b \*Batch\) Len\(\) int](<#Batch.Len>)
   - [func \(b \*Batch\) Statements\(\) \[\]Statement](<#Batch.Statements>)
 - [type BatchError](<#BatchError>)
@@ -193,6 +195,17 @@ func (b *Batch) AddStatement(s Statement) *Batch
 
 AddStatement queues a fully constructed Statement \(e.g. one using PreparedName/SkipPrepare\), returning the Batch for chaining.
 
+<a name="Batch.BuildSetOnlySQL"></a>
+### func \(\*Batch\) BuildSetOnlySQL
+
+```go
+func (b *Batch) BuildSetOnlySQL() (string, error)
+```
+
+BuildSetOnlySQL renders the same SET sequence Execute would send ahead of each statement's PREPARE/EXECUTE — including the leading "SET @\_multistmt\_statement\_num=0;" reset and, for a statement with Args, the same literal\-encoded argument assignments merged into its marker SET \(see build's doc comment for the full format and why marker\+args share one dispatch\) — but omits PREPARE, EXECUTE, and DEALLOCATE entirely.
+
+This exists to isolate the real cost of a workload's SET traffic: pointing it at the same Batch a caller would otherwise Execute reproduces the exact SET volume and argument shapes production traffic generates, without touching the underlying tables or running any real query, so it can be sent at matching throughput as an A/B baseline against the full batch.
+
 <a name="Batch.Execute"></a>
 ### func \(\*Batch\) Execute
 
@@ -205,6 +218,15 @@ Execute sends the whole batch to conn as a single multi\-statement round trip, i
 conn must be a single, stable connection \(\*sql.Conn, not \*sql.DB\) for the whole call: the position\-recovery marker is a session variable, and PREPARE/EXECUTE must run on the same session they were issued on.
 
 opts configures this one call; the only option today is WithPreparedCache, which enables server\-side PREPARE reuse across repeated Execute calls on the same physical connection. With no opts, every statement is freshly PREPAREd and DEALLOCATEd within this single call.
+
+<a name="Batch.ExecuteSetOnly"></a>
+### func \(\*Batch\) ExecuteSetOnly
+
+```go
+func (b *Batch) ExecuteSetOnly(ctx context.Context, conn *sql.Conn) error
+```
+
+ExecuteSetOnly sends BuildSetOnlySQL's output to conn as a single round trip — the same conn requirement \(a single, stable \*sql.Conn with multiStatements=true on its DSN\) as Execute, but with no PREPARE, EXECUTE, or real query reaching the server.
 
 <a name="Batch.Len"></a>
 ### func \(\*Batch\) Len
