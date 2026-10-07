@@ -331,25 +331,6 @@ every time. A failed iteration's `ROLLBACK` does not evict anything from the
 cache: the prepared statements themselves are still valid on the connection,
 only the data they touched got rolled back.
 
-### Isolating SET-dispatch cost: `BuildSetOnlySQL` / `ExecuteSetOnly`
-
-Every statement in a batch is preceded by its own `SET @_multistmt_statement_num=N[, @_multistmt_..._k=<literal>, ...]` marker (merged with that statement's Args, if any) — see the package doc comment and `build.go`'s own doc comment for why. That SET traffic is the dominant cost of running a workload through this package instead of one-statement-per-round-trip (a real production CPU-profile diff found it responsible for the large majority of the extra CPU, not the switch from binary to text protocol): isolating it from everything else in the batch is the direct way to measure it.
-
-`BuildSetOnlySQL` renders exactly that SET sequence — same statement count, same argument literals, same escaping — with PREPARE/EXECUTE/DEALLOCATE stripped out entirely, so nothing is actually prepared, executed, or read/written on the server:
-
-```go
-sql, err := b.BuildSetOnlySQL() // same b you would otherwise b.Execute(ctx, conn)
-// sql == "SET @_multistmt_statement_num=0;SET @_multistmt_statement_num=1;..."
-```
-
-`ExecuteSetOnly` sends it as one round trip, the same `conn` requirement as `Execute`:
-
-```go
-if err := b.ExecuteSetOnly(ctx, conn); err != nil { ... }
-```
-
-This is for an A/B comparison baseline (build the real production `Batch` — same templates, same bound args — at matching throughput, but run it through `ExecuteSetOnly` instead of `Execute` on a side-by-side connection/cluster), not a replacement for `Execute`: a batch sent through `ExecuteSetOnly` touches no table and its queued statements' `Callback`s never fire.
-
 ## Status
 
 Verified against a live TiDB (v8.5.8) covering: all-non-SELECT batches, mixed
@@ -372,9 +353,7 @@ returns the expected multiple rows, and `ExpandValues` bulk-inserting several
 rows — including rows containing quotes, backslashes, and a
 SQL-injection-shaped string (`'; DROP TABLE ...; --`) — in one round trip and
 reading every one back correctly (the table surviving the round trip is
-itself part of what's being checked), and `ExecuteSetOnly` against a real
-INSERT+SELECT+commit batch confirming the table's row count stayed at 0
-afterward (nothing was actually prepared, executed, or committed). See
+itself part of what's being checked). See
 `build_test.go`/`cache_test.go`/`inexpand_test.go`/`values_test.go` (pure
 unit tests) and `integration_test.go`/`cache_integration_test.go` (gated
 behind `MULTISTMT_TEST_DSN`, not required for `go test ./...`).
